@@ -301,6 +301,18 @@ def game_card(row):
     away_prob = row.get("ml_away_prob", 50)
     game_time = row.get("game_time", "TBD")
 
+    # Injury data
+    home_missing = int(row.get("home_missing_stars", 0))
+    away_missing = int(row.get("away_missing_stars", 0))
+    injury_note = None
+    if home_missing > 0 or away_missing > 0:
+        parts = []
+        if home_missing > 0:
+            parts.append(f"{ht}: {home_missing} out")
+        if away_missing > 0:
+            parts.append(f"{at}: {away_missing} out")
+        injury_note = " | ".join(parts)
+
     # Check if any bet qualifies for parlays
     parlay_ready = (
         (ml_conf >= PARLAY_MIN_CONFIDENCE and ml_ev >= PARLAY_MIN_EV) or
@@ -315,17 +327,34 @@ def game_card(row):
         ("SPR", row.get("spread_pick", "N/A"), row.get("spread_confidence", 50), row.get("spread_ev", 0), row.get("spread_odds", 1.9), row.get("spread_book", "")),
     ]
 
+    # Build header badges
+    header_badges = []
+    if parlay_ready:
+        header_badges.append(html.Span("PARLAY READY", style={
+            "fontSize": "9px", "padding": "2px 8px", "borderRadius": "10px",
+            "background": C["green"] + "22", "color": C["green"], "fontWeight": "700",
+            "letterSpacing": "0.5px", "marginRight": "4px",
+        }))
+    if injury_note:
+        header_badges.append(html.Span(f"INJURIES", style={
+            "fontSize": "9px", "padding": "2px 8px", "borderRadius": "10px",
+            "background": C["red"] + "22", "color": C["red"], "fontWeight": "700",
+            "letterSpacing": "0.5px",
+        }))
+
     return dbc.Col(
         html.Div([
             # Header
             html.Div([
                 html.Span(game_time, style={"color": C["muted"], "fontSize": "12px"}),
-                html.Span("PARLAY READY", style={
-                    "fontSize": "9px", "padding": "2px 8px", "borderRadius": "10px",
-                    "background": C["green"] + "22", "color": C["green"], "fontWeight": "700",
-                    "letterSpacing": "0.5px",
-                }) if parlay_ready else None,
+                html.Div(header_badges, style={"display": "flex", "gap": "4px"}),
             ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "12px"}),
+
+            # Injury detail line
+            html.Div(
+                injury_note,
+                style={"fontSize": "10px", "color": C["red"], "marginBottom": "8px", "opacity": "0.8"}
+            ) if injury_note else None,
 
             # Teams + Probability
             html.Div([

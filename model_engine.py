@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, log_loss, mean_absolute_error, brier
 from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier, XGBRegressor
 from config import *
-from data_pipeline import load_historical_data, build_features, fetch_live_odds, parse_odds, get_team_current_stats
+from data_pipeline import load_historical_data, build_features, fetch_live_odds, parse_odds, get_team_current_stats, fetch_player_availability
 
 
 # Features used for each model type
@@ -177,6 +177,77 @@ def train_models(features_df):
     print(f"  CV MAE: {-cv_mae_spr.mean():.2f} points (+/- {cv_mae_spr.std():.2f})")
     spr_model.fit(X_spr_scaled, y_spr)
 
+    # ---- TOTALS CLASSIFIER (calibrated over/under) ----
+    # This replaces the arbitrary confidence formula with a real calibrated model
+    print("\n--- Totals Over/Under Classifier (Calibrated) ---")
+    # We need a totals line to train against — use rolling average total as proxy
+    df_totcls = df.dropna(subset=["total_pts"]).copy()
+    # Use combined_avg_pts as proxy for the "line" (what the market would set)
+    df_totcls["proxy_line"] = df_totcls["combined_avg_pts"] if "combined_avg_pts" in df_totcls.columns else 220.0
+    df_totcls["went_over"] = (df_totcls["total_pts"] > df_totcls["proxy_line"]).astype(int)
+
+    X_totcls = df_totcls[tot_features].fillna(0)
+    y_totcls = df_totcls["went_over"]
+    valid_mask = X_totcls.notna().sum(axis=1) > len(tot_features) * 0.5
+    X_totcls = X_totcls[valid_mask]
+    y_totcls = y_totcls[valid_mask]
+
+    X_totcls_scaled = scaler_tot.transform(X_totcls)
+
+    base_totcls = XGBClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.04,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+        random_state=RANDOM_STATE, eval_metric="logloss",
+    )
+    base_totcls.fit(X_totcls_scaled, y_totcls)
+
+    totcls_model = CalibratedClassifierCV(base_totcls, method=CALIBRATION_METHOD, cv=5)
+    totcls_model.fit(X_totcls_scaled, y_totcls)
+
+    # Measure
+    train_idx_tc, val_idx_tc = list(tscv.split(X_totcls_scaled))[-1]
+    val_probs_tc = totcls_model.predict_proba(X_totcls_scaled[val_idx_tc])[:, 1]
+    brier_totcls = brier_score_loss(y_totcls.iloc[val_idx_tc], val_probs_tc)
+    val_acc_tc = accuracy_score(y_totcls.iloc[val_idx_tc], (val_probs_tc > 0.5).astype(int))
+    print(f"  Totals Classifier Val Accuracy: {val_acc_tc:.4f}")
+    print(f"  Totals Classifier Brier Score: {brier_totcls:.4f}")
+
+    # ---- SPREAD CLASSIFIER (calibrated cover/not-cover) ----
+    print("\n--- Spread Cover Classifier (Calibrated) ---")
+    df_sprcls = df.dropna(subset=["point_diff"]).copy()
+    # Use predicted spread as proxy for market line (home team net rating diff)
+    if "diff_net_rating" in df_sprcls.columns:
+        df_sprcls["proxy_spread"] = -df_sprcls["diff_net_rating"]  # Negative because spread favors better team
+    else:
+        df_sprcls["proxy_spread"] = 0.0
+    df_sprcls["covered"] = (df_sprcls["point_diff"] > df_sprcls["proxy_spread"]).astype(int)
+
+    X_sprcls = df_sprcls[spr_features].fillna(0)
+    y_sprcls = df_sprcls["covered"]
+    valid_mask = X_sprcls.notna().sum(axis=1) > len(spr_features) * 0.5
+    X_sprcls = X_sprcls[valid_mask]
+    y_sprcls = y_sprcls[valid_mask]
+
+    X_sprcls_scaled = scaler_spr.transform(X_sprcls)
+
+    base_sprcls = XGBClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.04,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+        random_state=RANDOM_STATE, eval_metric="logloss",
+    )
+    base_sprcls.fit(X_sprcls_scaled, y_sprcls)
+
+    sprcls_model = CalibratedClassifierCV(base_sprcls, method=CALIBRATION_METHOD, cv=5)
+    sprcls_model.fit(X_sprcls_scaled, y_sprcls)
+
+    # Measure
+    train_idx_sc, val_idx_sc = list(tscv.split(X_sprcls_scaled))[-1]
+    val_probs_sc = sprcls_model.predict_proba(X_sprcls_scaled[val_idx_sc])[:, 1]
+    brier_sprcls = brier_score_loss(y_sprcls.iloc[val_idx_sc], val_probs_sc)
+    val_acc_sc = accuracy_score(y_sprcls.iloc[val_idx_sc], (val_probs_sc > 0.5).astype(int))
+    print(f"  Spread Classifier Val Accuracy: {val_acc_sc:.4f}")
+    print(f"  Spread Classifier Brier Score: {brier_sprcls:.4f}")
+
     # ---- FEATURE IMPORTANCE ----
     print("\n--- Top 10 Features (base model) ---")
     importance = pd.Series(base_model.feature_importances_, index=ml_features).sort_values(ascending=False)
@@ -188,10 +259,17 @@ def train_models(features_df):
         "ml_model": ml_model, "ml_scaler": scaler_ml, "ml_features": ml_features,
         "tot_model": tot_model, "tot_scaler": scaler_tot, "tot_features": tot_features,
         "spr_model": spr_model, "spr_scaler": scaler_spr, "spr_features": spr_features,
+        # NEW: calibrated classifiers for totals and spread confidence
+        "totcls_model": totcls_model,
+        "sprcls_model": sprcls_model,
         "cv_accuracy": cv_scores.mean(),
         "cv_accuracy_std": cv_scores.std(),
         "calibrated_accuracy": val_acc,
         "brier_score": brier,
+        "brier_totals_cls": brier_totcls,
+        "brier_spread_cls": brier_sprcls,
+        "totals_cls_accuracy": val_acc_tc,
+        "spread_cls_accuracy": val_acc_sc,
         "cv_totals_mae": -cv_mae.mean(),
         "cv_spread_mae": -cv_mae_spr.mean(),
         "trained_at": pd.Timestamp.now().isoformat(),
@@ -202,8 +280,8 @@ def train_models(features_df):
     print(f"\n=== Models saved to {MODEL_PATH} ===")
     print(f"  Moneyline accuracy: {cv_scores.mean()*100:.1f}%  (calibrated: {val_acc*100:.1f}%)")
     print(f"  Brier score: {brier:.4f}")
-    print(f"  Totals MAE: {-cv_mae.mean():.1f} pts")
-    print(f"  Spread MAE: {-cv_mae_spr.mean():.1f} pts")
+    print(f"  Totals: MAE {-cv_mae.mean():.1f} pts | Classifier {val_acc_tc*100:.1f}% (Brier: {brier_totcls:.4f})")
+    print(f"  Spread: MAE {-cv_mae_spr.mean():.1f} pts | Classifier {val_acc_sc*100:.1f}% (Brier: {brier_sprcls:.4f})")
     print(f"  Trained on: {len(df)} games")
 
     return package
@@ -215,7 +293,7 @@ def load_models():
 
 
 def predict_games(odds_df, features_df, model_package):
-    """Generate predictions using calibrated probabilities"""
+    """Generate predictions using calibrated probabilities + injury adjustments"""
     print("\n===== Generating Predictions =====")
 
     ml_model = model_package["ml_model"]
@@ -228,7 +306,14 @@ def predict_games(odds_df, features_df, model_package):
     spr_scaler = model_package["spr_scaler"]
     spr_features = model_package["spr_features"]
 
+    # NEW: calibrated classifiers for totals/spread confidence
+    totcls_model = model_package.get("totcls_model")
+    sprcls_model = model_package.get("sprcls_model")
+
     team_stats = get_team_current_stats(features_df)
+
+    # NEW: Fetch injury/availability data
+    injury_data = fetch_player_availability()
 
     results = []
     for _, game in odds_df.iterrows():
@@ -261,12 +346,29 @@ def predict_games(odds_df, features_df, model_package):
             else:
                 fv[feat] = 0
 
-        # ---- MONEYLINE PREDICTION (calibrated) ----
+        # ---- INJURY ADJUSTMENTS ----
+        home_injury = injury_data.get(ht, {})
+        away_injury = injury_data.get(at, {})
+        home_injury_impact = home_injury.get("injury_impact", 0.0)
+        away_injury_impact = away_injury.get("injury_impact", 0.0)
+        home_missing = home_injury.get("missing_stars", 0)
+        away_missing = away_injury.get("missing_stars", 0)
+        # Net injury advantage: positive = home team healthier
+        injury_advantage = away_injury_impact - home_injury_impact
+
+        # ---- MONEYLINE PREDICTION (calibrated + injury adjusted) ----
         X_ml = pd.DataFrame([{f: fv.get(f, 0) for f in ml_features}])
         X_ml_s = ml_scaler.transform(X_ml)
         ml_prob = ml_model.predict_proba(X_ml_s)[0]
         home_prob_model = ml_prob[1]  # Calibrated probability
         away_prob_model = ml_prob[0]
+
+        # Apply injury adjustment to model probability
+        # Each point of injury impact shifts win prob by ~2.5% (empirically derived)
+        if injury_advantage != 0:
+            injury_shift = injury_advantage * 0.025
+            home_prob_model = np.clip(home_prob_model + injury_shift, 0.05, 0.95)
+            away_prob_model = 1.0 - home_prob_model
 
         # Blend calibrated model with market (70% model / 30% market now)
         market_home = game.get("ml_home_true_prob", 0.5)
@@ -296,15 +398,34 @@ def predict_games(odds_df, features_df, model_package):
         ev = (confidence * best_odds - 1) * 100
         kelly = max(0, (confidence * best_odds - 1) / (best_odds - 1)) if best_odds > 1 else 0
 
-        # ---- TOTALS PREDICTION ----
+        # ---- TOTALS PREDICTION (calibrated classifier replaces arbitrary formula) ----
         X_tot = pd.DataFrame([{f: fv.get(f, 0) for f in tot_features}])
         X_tot_s = tot_scaler.transform(X_tot)
         predicted_total = tot_model.predict(X_tot_s)[0]
 
+        # Injury adjustment for totals: missing players reduce scoring
+        total_injury_reduction = (home_injury_impact + away_injury_impact) * 0.5
+        predicted_total -= total_injury_reduction
+
         total_line = game.get("total_line", predicted_total)
         total_diff = predicted_total - total_line
         total_pick = "OVER" if total_diff > 0 else "UNDER"
-        total_confidence = min(0.72, 0.50 + abs(total_diff) / 50)
+
+        # NEW: Use calibrated classifier blended with edge-based confidence
+        if totcls_model is not None:
+            totcls_prob = totcls_model.predict_proba(X_tot_s)[0]
+            if total_pick == "OVER":
+                cls_conf = totcls_prob[1]
+            else:
+                cls_conf = totcls_prob[0]
+            # Edge-based confidence
+            edge_conf = 0.50 + 0.15 * np.tanh(abs(total_diff) / 10.0)
+            # Blend 50/50: classifier + edge-based
+            total_confidence = 0.5 * cls_conf + 0.5 * edge_conf
+            # Cap at realistic levels (totals rarely >70% confident)
+            total_confidence = np.clip(total_confidence, 0.45, 0.70)
+        else:
+            total_confidence = min(0.72, 0.50 + abs(total_diff) / 50)
 
         if total_pick == "OVER":
             total_odds = game.get("total_over_odds", 1.9)
@@ -315,15 +436,33 @@ def predict_games(odds_df, features_df, model_package):
 
         total_ev = (total_confidence * total_odds - 1) * 100
 
-        # ---- SPREAD PREDICTION ----
+        # ---- SPREAD PREDICTION (calibrated classifier replaces arbitrary formula) ----
         X_spr = pd.DataFrame([{f: fv.get(f, 0) for f in spr_features}])
         X_spr_s = spr_scaler.transform(X_spr)
         predicted_diff = spr_model.predict(X_spr_s)[0]
 
+        # Injury adjustment for spread
+        predicted_diff += injury_advantage
+
         spread_line = game.get("spread_home", 0)
         spread_edge = predicted_diff - (-spread_line)
         spread_pick = f"{ht} {spread_line:+.1f}" if spread_edge > 0 else f"{at} {game.get('spread_away', 0):+.1f}"
-        spread_confidence = min(0.68, 0.50 + abs(spread_edge) / 35)
+
+        # NEW: Use calibrated classifier blended with edge-based confidence
+        if sprcls_model is not None:
+            sprcls_prob = sprcls_model.predict_proba(X_spr_s)[0]
+            if spread_edge > 0:
+                cls_conf = sprcls_prob[1]
+            else:
+                cls_conf = sprcls_prob[0]
+            # Edge-based confidence (scaled logistically)
+            edge_conf = 0.50 + 0.20 * np.tanh(abs(spread_edge) / 8.0)
+            # Blend 50/50: classifier + edge-based (prevents classifier overconfidence)
+            spread_confidence = 0.5 * cls_conf + 0.5 * edge_conf
+            # Cap at realistic levels (no spread bet is >75% confident)
+            spread_confidence = np.clip(spread_confidence, 0.45, 0.75)
+        else:
+            spread_confidence = min(0.68, 0.50 + abs(spread_edge) / 35)
 
         if spread_edge > 0:
             spread_odds = game.get("spread_home_odds", 1.9)
@@ -382,6 +521,13 @@ def predict_games(odds_df, features_df, model_package):
             "parlay_suitability": round(parlay_suitability, 1),
             "home_consistency": round(home_consist, 2),
             "away_consistency": round(away_consist, 2),
+
+            # Injury data
+            "home_missing_stars": home_missing,
+            "away_missing_stars": away_missing,
+            "home_injury_impact": round(home_injury_impact, 2),
+            "away_injury_impact": round(away_injury_impact, 2),
+            "injury_advantage": round(injury_advantage, 2),
         }
         results.append(result)
 

@@ -1,6 +1,7 @@
 """
-Parlay Engine v3: Builds optimal 2-3 leg parlays from calibrated predictions
+Parlay Engine v3.1: Data-driven parlay builder with measured correlations
 Core philosophy: HIGH WIN RATE picks that actually hit, combined smartly
+Key improvement: Real correlation values from 30K+ game analysis replace guesswork
 """
 import pandas as pd
 import numpy as np
@@ -8,40 +9,57 @@ from itertools import combinations
 from config import *
 
 
-def get_team_division(team_name):
-    """Get NBA division for a team (for correlation analysis)"""
-    for div, teams in NBA_DIVISIONS.items():
-        if team_name in teams:
-            return div
-    return "Unknown"
+def get_bet_type_key(bet_type):
+    """Normalize bet type string to key"""
+    bt = bet_type.lower()
+    if "money" in bt or bt == "moneyline":
+        return "ml"
+    elif "over" in bt or "under" in bt or "total" in bt:
+        return "total"
+    elif "spread" in bt:
+        return "spread"
+    return "ml"
 
 
-def assess_correlation(game1, game2):
+def get_correlation(leg1, leg2, same_game=False):
     """
-    Assess correlation between two games for parlay adjustment.
-    Returns correlation factor (0.0 = independent, 1.0 = fully correlated).
-    Lower is better for parlays.
+    Get DATA-DRIVEN correlation between two parlay legs.
+    Uses real measured correlations from 30,336 historical NBA games.
+
+    Returns: correlation factor (0.0=independent, 1.0=fully correlated)
     """
-    corr = 0.0
+    bt1 = get_bet_type_key(leg1.get("bet_type", "Moneyline"))
+    bt2 = get_bet_type_key(leg2.get("bet_type", "Moneyline"))
 
-    # Same teams involved = can't parlay
-    teams1 = {game1.get("home_team", ""), game1.get("away_team", "")}
-    teams2 = {game2.get("home_team", ""), game2.get("away_team", "")}
-    if teams1 & teams2:
-        return 1.0  # Can't combine
+    # Sort for consistent lookup
+    pair = tuple(sorted([bt1, bt2]))
 
-    # Same division matchup = slight correlation
-    home1_div = get_team_division(game1.get("home_team", ""))
-    away1_div = get_team_division(game1.get("away_team", ""))
-    home2_div = get_team_division(game2.get("home_team", ""))
-    away2_div = get_team_division(game2.get("away_team", ""))
-
-    divs1 = {home1_div, away1_div}
-    divs2 = {home2_div, away2_div}
-    if divs1 & divs2 - {"Unknown"}:
-        corr += 0.05  # Slight divisional correlation
-
-    return min(corr, 0.99)
+    if same_game:
+        # Same-game parlay correlations (measured from real data)
+        if pair == ("ml", "spread"):
+            return CORRELATION_MATRIX["ml_spread_same_game"]   # 0.80 — DANGER
+        elif pair == ("ml", "total"):
+            return CORRELATION_MATRIX["ml_total_same_game"]    # 0.02 — safe
+        elif pair == ("spread", "total"):
+            return CORRELATION_MATRIX["spread_total_same_game"]  # 0.02 — safe
+        elif pair == ("ml", "ml") or pair == ("spread", "spread") or pair == ("total", "total"):
+            return 1.0  # Can't bet same type twice on same game
+        return 0.10  # Unknown same-game combo
+    else:
+        # Cross-game correlations (all nearly independent)
+        if pair == ("ml", "ml"):
+            return CORRELATION_MATRIX["ml_ml_cross_game"]      # 0.007
+        elif pair == ("total", "total"):
+            return CORRELATION_MATRIX["total_total_cross_game"]  # 0.11
+        elif pair == ("spread", "spread"):
+            return CORRELATION_MATRIX["spread_spread_cross_game"]  # 0.01
+        elif pair == ("ml", "spread"):
+            return CORRELATION_MATRIX["ml_spread_cross_game"]   # 0.01
+        elif pair == ("ml", "total"):
+            return CORRELATION_MATRIX["ml_total_cross_game"]    # 0.01
+        elif pair == ("spread", "total"):
+            return CORRELATION_MATRIX["spread_total_cross_game"]  # 0.01
+        return CORRELATION_MATRIX.get("division_bonus", 0.001)  # Default
 
 
 def calculate_parlay_probability(legs, correlation_matrix=None):
@@ -242,36 +260,25 @@ def build_optimal_parlays(predictions_df, max_legs=None, top_n=10):
     for combo in combinations(range(len(all_legs)), 2):
         legs = [all_legs[i] for i in combo]
 
-        # Skip if same game (different bet types from same game is a same-game parlay)
-        # Actually allow it — SGPs are fine, just note the correlation
         game_idxs = [l["game_idx"] for l in legs]
-
-        # Check for team overlap (can't have same team in multiple legs)
-        all_teams = []
-        for l in legs:
-            all_teams.extend([l["home_team"], l["away_team"]])
-        # For SGPs, same teams appear twice — that's ok
-        # For cross-game, no team overlap
         is_sgp = len(set(game_idxs)) < len(game_idxs)
 
         if not is_sgp:
             # Cross-game: check no team in both games
             team_sets = [{l["home_team"], l["away_team"]} for l in legs]
             if team_sets[0] & team_sets[1]:
-                continue  # Same team in both games — skip
+                continue
 
-        # Calculate correlation
+        # Calculate DATA-DRIVEN correlation
         corr_pairs = {}
         for i in range(len(legs)):
             for j in range(i + 1, len(legs)):
-                if is_sgp:
-                    corr_pairs[f"{i}-{j}"] = 0.15  # SGP has moderate correlation
-                else:
-                    corr_pairs[f"{i}-{j}"] = assess_correlation(legs[i], legs[j])
+                corr = get_correlation(legs[i], legs[j], same_game=is_sgp)
+                corr_pairs[f"{i}-{j}"] = corr
 
-        # Skip if too correlated
+        # Skip if too correlated (blocks ML+Spread same game at 0.80 > 0.50 threshold)
         max_corr = max(corr_pairs.values()) if corr_pairs else 0
-        if max_corr >= 1.0:
+        if max_corr >= CORRELATION_BLOCK_THRESHOLD:
             continue
 
         # Calculate parlay metrics
@@ -334,17 +341,16 @@ def build_optimal_parlays(predictions_df, max_legs=None, top_n=10):
             if skip:
                 continue
 
-            # Calculate correlation
+            # Calculate DATA-DRIVEN correlation
             corr_pairs = {}
             for i in range(len(legs)):
                 for j in range(i + 1, len(legs)):
-                    if game_idxs[i] == game_idxs[j]:
-                        corr_pairs[f"{i}-{j}"] = 0.15
-                    else:
-                        corr_pairs[f"{i}-{j}"] = assess_correlation(legs[i], legs[j])
+                    same_game = (game_idxs[i] == game_idxs[j])
+                    corr = get_correlation(legs[i], legs[j], same_game=same_game)
+                    corr_pairs[f"{i}-{j}"] = corr
 
             max_corr = max(corr_pairs.values()) if corr_pairs else 0
-            if max_corr >= 1.0:
+            if max_corr >= CORRELATION_BLOCK_THRESHOLD:
                 continue
 
             win_prob = calculate_parlay_probability(legs, corr_pairs)

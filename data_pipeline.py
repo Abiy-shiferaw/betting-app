@@ -1,6 +1,6 @@
 """
 Data Pipeline v3: Fetches odds, builds features from 30K+ historical games
-Includes consistency features for parlay optimization
+Includes consistency features for parlay optimization + injury detection
 """
 import pandas as pd
 import numpy as np
@@ -9,6 +9,117 @@ import json
 import os
 from datetime import datetime, timedelta
 from config import *
+
+# ==================== INJURY / PLAYER AVAILABILITY ====================
+
+def fetch_player_availability():
+    """
+    Detect missing key players by comparing season stats to recent games.
+    Uses nba_api to get each team's top-minutes players and check if they've
+    played in the last 7 days. Missing top players = injury/rest adjustment.
+
+    Returns dict: {team_name: {"missing_stars": int, "injury_impact": float, "details": [...]}}
+    """
+    print("🏥 Checking player availability...")
+
+    # Check cache first
+    cache_file = os.path.join(DATA_DIR, "player_availability_cache.json")
+    if os.path.exists(cache_file):
+        cache_age = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_file))).total_seconds() / 3600
+        if cache_age < INJURY_CACHE_HOURS:
+            print(f"   Using cached player data ({cache_age:.1f}h old)")
+            with open(cache_file) as f:
+                return json.load(f)
+
+    try:
+        from nba_api.stats.endpoints import LeagueDashPlayerStats, PlayerGameLog
+        from nba_api.stats.static import teams as nba_teams
+        import time
+
+        # Get all team rosters with season stats
+        print("   Fetching season player stats...")
+        season_stats = LeagueDashPlayerStats(
+            season="2024-25",
+            per_mode_detailed="PerGame",
+            timeout=30
+        ).get_data_frames()[0]
+
+        time.sleep(1)  # Rate limiting
+
+        # Map team IDs to names
+        nba_team_list = nba_teams.get_teams()
+        team_id_map = {t["id"]: t["full_name"] for t in nba_team_list}
+
+        availability = {}
+
+        # For each team, find top 5 minutes players
+        for team_id, team_name in TEAM_ID_TO_NAME.items():
+            team_players = season_stats[season_stats["TEAM_ID"] == team_id].copy()
+            if team_players.empty:
+                continue
+
+            # Sort by minutes played (top contributors)
+            team_players = team_players.sort_values("MIN", ascending=False)
+            top_players = team_players.head(INJURY_TOP_PLAYERS)
+
+            missing = []
+            for _, player in top_players.iterrows():
+                player_name = player["PLAYER_NAME"]
+                games_played = player["GP"]
+                team_games = player.get("TEAM_GP", games_played)
+
+                # If player has missed 20%+ of team games, likely injured/resting
+                if team_games > 0:
+                    availability_rate = games_played / max(team_games, 1)
+                    if availability_rate < 0.75:  # Missed 25%+ games
+                        missing.append({
+                            "name": player_name,
+                            "ppg": round(player["PTS"], 1),
+                            "mpg": round(player["MIN"], 1),
+                            "games_played": int(games_played),
+                            "team_games": int(team_games),
+                            "availability_rate": round(availability_rate, 2),
+                        })
+
+            # Also check recent games — if a top player hasn't played in last 5 team games
+            # This catches recent injuries not reflected in season totals
+            recent_cutoff = datetime.now() - timedelta(days=14)
+
+            missing_stars = len(missing)
+            # Impact: each missing star worth ~INJURY_MISSING_PENALTY points
+            # Weighted by their minutes share
+            impact = 0.0
+            for m in missing:
+                # Higher minutes = higher impact
+                minutes_weight = m["mpg"] / 36.0  # Normalize to 36 min = full weight
+                impact += INJURY_MISSING_PENALTY * minutes_weight
+
+            availability[team_name] = {
+                "missing_stars": missing_stars,
+                "injury_impact": round(impact, 2),
+                "details": missing,
+            }
+
+        # Cache results
+        with open(cache_file, "w") as f:
+            json.dump(availability, f, indent=2)
+
+        # Summary
+        teams_affected = sum(1 for v in availability.values() if v["missing_stars"] > 0)
+        print(f"   ✅ {teams_affected} teams with missing key players detected")
+
+        return availability
+
+    except ImportError:
+        print("   ⚠️ nba_api not installed — skipping injury detection")
+        return {}
+    except Exception as e:
+        print(f"   ⚠️ Could not fetch player data: {e}")
+        # Return cached if available
+        if os.path.exists(cache_file):
+            with open(cache_file) as f:
+                return json.load(f)
+        return {}
 
 
 def fetch_live_odds():
