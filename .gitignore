@@ -10,11 +10,12 @@ __pycache__/
 dist/
 build/
 
-# Model files (large binaries)
-*.pkl
+# Model files (large binaries) — EXCEPT model_v3.pkl which is needed for deployment
+# *.pkl  # Commented out: we need model_v3.pkl in repo for Render deployment
 
 # Data caches
 nba_odds_live.json
+player_availability_cache.json
 
 # IDE
 .idea/

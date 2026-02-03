@@ -774,54 +774,42 @@ def handle_buttons(refresh_clicks, retrain_clicks):
         return "", ""
 
     btn = ctx.triggered[0]["prop_id"].split(".")[0]
-    venv_python = os.path.join(DATA_DIR, "venv", "bin", "python")
-    if not os.path.exists(venv_python):
-        venv_python = sys.executable
 
     if btn == "btn-retrain":
         try:
-            result = subprocess.run(
-                [venv_python, os.path.join(DATA_DIR, "model_engine.py")],
-                capture_output=True, text=True, timeout=600, cwd=DATA_DIR,
-            )
-            if result.returncode == 0:
-                msg = dbc.Alert("Model retrained! Refresh page to see updated picks.", color="success", dismissable=True)
+            from model_engine import run_full_pipeline
+            predictions, package, features_df = run_full_pipeline()
+            if predictions is not None:
+                msg = dbc.Alert(
+                    f"Model retrained on {package.get('n_games_trained', '?')} games! "
+                    f"Accuracy: {package.get('cv_accuracy', 0)*100:.1f}%. Reload page to see updated picks.",
+                    color="success", dismissable=True
+                )
             else:
-                msg = dbc.Alert(f"Training error: {result.stderr[-300:]}", color="warning", dismissable=True)
-        except subprocess.TimeoutExpired:
-            msg = dbc.Alert("Training timed out (>10 min).", color="warning", dismissable=True)
+                msg = dbc.Alert("Model retrained but no odds available.", color="info", dismissable=True)
         except Exception as e:
-            msg = dbc.Alert(f"Error: {str(e)}", color="danger", dismissable=True)
+            msg = dbc.Alert(f"Training error: {str(e)[:300]}", color="danger", dismissable=True)
         return msg, ""
 
     elif btn == "btn-refresh":
         try:
-            result = subprocess.run(
-                [venv_python, "-c", """
-import sys; sys.path.insert(0, '.')
-from data_pipeline import fetch_live_odds, parse_odds, load_historical_data, build_features
-from model_engine import load_models, predict_games
-odds = fetch_live_odds()
-if odds:
-    odds_df = parse_odds(odds)
-    df = load_historical_data()
-    features = build_features(df)
-    pkg = load_models()
-    predict_games(odds_df, features, pkg)
-    print("OK")
-else:
-    print("NO_ODDS")
-"""],
-                capture_output=True, text=True, timeout=300, cwd=DATA_DIR,
-            )
-            if "OK" in result.stdout:
+            from data_pipeline import fetch_live_odds, parse_odds, load_historical_data, build_features
+            from model_engine import load_models, predict_games
+
+            odds = fetch_live_odds()
+            if odds:
+                odds_df = parse_odds(odds)
+                df = load_historical_data()
+                features = build_features(df)
+                pkg = load_models()
+                predict_games(odds_df, features, pkg)
                 msg = dbc.Alert("Predictions refreshed! Reload the page.", color="success", dismissable=True)
-            elif "NO_ODDS" in result.stdout:
-                msg = dbc.Alert("No odds available (no games today or off-season).", color="info", dismissable=True)
             else:
-                msg = dbc.Alert("No trained model found. Click 'Retrain' first.", color="warning", dismissable=True)
+                msg = dbc.Alert("No odds available (no games today or off-season).", color="info", dismissable=True)
+        except FileNotFoundError:
+            msg = dbc.Alert("No trained model found. Click 'Retrain' first.", color="warning", dismissable=True)
         except Exception as e:
-            msg = dbc.Alert(f"Error: {str(e)}", color="danger", dismissable=True)
+            msg = dbc.Alert(f"Error: {str(e)[:300]}", color="danger", dismissable=True)
         return msg, ""
 
     return "", ""
@@ -830,6 +818,8 @@ else:
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("NBA Parlay AI Dashboard v3")
-    print("  http://127.0.0.1:8050")
-    app.run(debug=True, host="0.0.0.0", port=8050)
+    port = int(os.environ.get("PORT", 8050))
+    debug = os.environ.get("RENDER") is None  # Debug only in local dev
+    print(f"NBA Parlay AI Dashboard v3")
+    print(f"  http://127.0.0.1:{port}")
+    app.run(debug=debug, host="0.0.0.0", port=port)
